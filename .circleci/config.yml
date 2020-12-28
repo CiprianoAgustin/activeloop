@@ -1,0 +1,162 @@
+version: 2.1
+
+orbs:
+  slack: circleci/slack@3.4.2
+  codecov: codecov/codecov@1.1.1
+
+workflows:
+  test:
+    jobs:
+      - test:
+          context: 
+            - test
+            - azure
+      - test_full:
+          context:
+            - test
+            - azure
+
+  test_and_deploy:
+    jobs:
+      - test:
+          context:  
+            - test
+            - azure
+          filters:
+            tags:
+              only: /[0-9]+(\.[0-9]+)*/
+            branches:
+              ignore: /.*/
+      - test_full:
+          context:  
+            - test
+            - azure
+          filters:
+            tags:
+              only: /[0-9]+(\.[0-9]+)*/
+            branches:
+              ignore: /.*/
+      - deploy:
+          context: 
+            - pypi
+            - snark-docker
+          requires:
+            - test
+            - test_full
+          filters:
+            tags:
+              only: /[0-9]+(\.[0-9]+)*/
+            branches:
+              ignore: /.*/
+
+jobs:
+  test:
+   docker:
+      - image: circleci/python:3.8
+   steps:
+      - checkout
+      - run:
+          name: "Prep Google credentials"
+          command: |
+            mkdir -p "/home/circleci/.secrets/"
+            echo "$GOOGLE_APPLICATION_CREDENTIALS" | base64 --decode > "/home/circleci/.secrets/gcs.json"
+      - run:
+          name: "Collecting requirements"
+          command: |
+            pip install -r requirements-dev.txt
+            pip install -r requirements.txt
+            pip install -e .
+      - run:
+          name: "Checking code style"
+          command: |
+            pip install flake8
+            flake8 . --count --exit-zero --max-complexity=10 --statistics
+      - run:
+          name: "Running tests"
+          command: |
+            export GOOGLE_APPLICATION_CREDENTIALS=/home/circleci/.secrets/gcs.json
+            pytest --cov-report=xml --cov=./
+      - slack/status:
+          fail_only: true
+          webhook: $SLACK_WEBHOOK
+
+
+  test_full:
+    docker:
+      - image: circleci/python:3.8
+    steps:
+      - checkout
+      - run:
+          name: "Prep Google credentials"
+          command: |
+            mkdir -p "/home/circleci/.secrets/"
+            echo "$GOOGLE_APPLICATION_CREDENTIALS" | base64 --decode > "/home/circleci/.secrets/gcs.json"
+      - run:
+          name: "Collecting requirements"
+          command: |
+            pip install -r requirements-dev.txt
+            pip install -r requirements-optional.txt
+            pip install -r requirements.txt
+            pip install -e .
+      - run:
+          name: "Checking code style"
+          command: |
+            pip install flake8
+            flake8 . --count --exit-zero --max-complexity=10 --statistics
+      - run:
+          name: "Running tests"
+          command: |
+            export GOOGLE_APPLICATION_CREDENTIALS=/home/circleci/.secrets/gcs.json
+            pytest --cov-report=xml --cov=./
+      - codecov/upload:
+          file: coverage.xml
+      - store_test_results:
+          path: test-reports
+      - store_artifacts:
+          path: test-reports
+      - slack/status:
+          fail_only: true
+          webhook: $SLACK_WEBHOOK
+
+  deploy:
+    docker:
+      - image: circleci/python:3.8
+    environment:
+      IMAGE_NAME: snarkai/hub
+    steps:
+      - checkout
+      - run:
+          name: "Init .pypirc"
+          command: |
+            echo -e "[pypi]" >> ~/.pypirc
+            echo -e "username = __token__" >> ~/.pypirc
+            echo -e "password = $TWINE_PASSWORD" >> ~/.pypirc
+      - run:
+          name: "Create a source distribution & wheel"
+          command: |
+            python setup.py sdist
+            python setup.py bdist_wheel
+      - run:
+          name: "Install twine via pip"
+          command: |
+            pip install twine
+      - run:
+          name: "Upload dist to PyPi"
+          command: |
+            twine upload dist/*
+      - run:
+          name: "Build Docker Hub Image"
+          command: |
+            docker build -t $IMAGE_NAME:latest .
+      - run:
+          name: "Deploy to Docker Hub"
+          command: |
+            echo "$DOCKER_HUB_PASSWORD" | docker login -u "$DOCKER_HUB_USERNAME" --password-stdin
+            IMAGE_TAG=${CIRCLE_TAG}
+            docker tag $IMAGE_NAME:latest $IMAGE_NAME:$IMAGE_TAG
+            docker push $IMAGE_NAME:latest
+            docker push $IMAGE_NAME:$IMAGE_TAG
+      - slack/status:
+          fail_only: true
+          webhook: $SLACK_WEBHOOK
+
